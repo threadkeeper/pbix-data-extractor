@@ -1,0 +1,33 @@
+# VS Code
+.vscode/
+*.code-workspace
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.venv/
+env/
+venv/
+
+# OS
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.DS_Store
+
+# Logs
+*.log
+*.txt
+
+# Generated SQL and data files
+*.sql
+*.csv
+data/
+
+# Power BI extracted contents
+pbix_extracted/
+*.pbix
