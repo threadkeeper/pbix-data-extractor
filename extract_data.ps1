@@ -13,7 +13,7 @@
 
 param(
     [string]$OutputFile = "insert_data.sql",
-    [int]$BatchSize = 5000
+    [int]$BatchSize = 1000
 )
 
 $ErrorActionPreference = "Stop"
@@ -67,35 +67,62 @@ while ($reader.Read()) {
 $reader.Close()
 Write-Host "Found $($tables.Count) tables: $($tables -join ', ')"
 
-# --- Get column info for each table via DMV ---
+# --- Build TMSCHEMA column lookup (accurate types, excludes calculated/RowNumber) ---
+# TMSCHEMA_COLUMNS.Type: 1 = Data, 2 = Calculated, 3 = RowNumber
+# TMSCHEMA_COLUMNS.DataType: 2=String, 6=Int64, 8=Double, 9=DateTime, 10=Decimal, 11=Boolean
+
+$tblCmd = $conn.CreateCommand()
+$tblCmd.CommandText = "SELECT [ID], [Name] FROM `$SYSTEM.TMSCHEMA_TABLES"
+$tblReader = $tblCmd.ExecuteReader()
+$tableIdToName = @{}
+$tableNameToId = @{}
+while ($tblReader.Read()) {
+    $tableIdToName[$tblReader[0].ToString()] = $tblReader[1].ToString()
+    $tableNameToId[$tblReader[1].ToString()] = $tblReader[0].ToString()
+}
+$tblReader.Close()
+
+# Load all data columns (Type=1) with their real DataType
+$tmColCmd = $conn.CreateCommand()
+$tmColCmd.CommandText = "SELECT [TableID], [ExplicitName], [ExplicitDataType] FROM `$SYSTEM.TMSCHEMA_COLUMNS WHERE [Type] = 1"
+$tmColReader = $tmColCmd.ExecuteReader()
+$tmschemaColumns = @{} # key = tableName, value = list of @{Name;DataType}
+while ($tmColReader.Read()) {
+    $tableId = $tmColReader[0].ToString()
+    $colName = $tmColReader[1].ToString()
+    $dataType = [int]$tmColReader[2]
+    $tblName = $tableIdToName[$tableId]
+    if (-not $tmschemaColumns.ContainsKey($tblName)) {
+        $tmschemaColumns[$tblName] = [System.Collections.Generic.List[hashtable]]::new()
+    }
+    $tmschemaColumns[$tblName].Add(@{ Name = $colName; DataType = $dataType })
+}
+$tmColReader.Close()
+
+# Count tables that have data columns vs those excluded (calculated tables)
+$dataTableCount = $tmschemaColumns.Count
+$excludedTableCount = $tables.Count - $dataTableCount
+Write-Host "Found $dataTableCount data tables, $excludedTableCount calculated tables excluded"
+
+# --- Get column info for a table from our TMSCHEMA cache ---
 function Get-TableColumns {
     param([string]$TableName)
-    $colCmd = $conn.CreateCommand()
-    $dmvTableName = "`$$TableName"
-    $colCmd.CommandText = "SELECT [COLUMN_NAME], [DATA_TYPE] FROM `$SYSTEM.DBSCHEMA_COLUMNS WHERE [TABLE_NAME] = '$($dmvTableName.Replace("'","''"))'"
-    $colReader = $colCmd.ExecuteReader()
-    $columns = @()
-    while ($colReader.Read()) {
-        $colName = $colReader[0].ToString()
-        if ($colName -notlike 'RowNumber*') {
-            $columns += @{ Name = $colName; DataType = $colReader[1] }
-        }
+    if ($tmschemaColumns.ContainsKey($TableName)) {
+        return $tmschemaColumns[$TableName]
     }
-    $colReader.Close()
-    return $columns
+    return @()
 }
 
-# --- Map SSAS data types to SQL types ---
+# --- Map TMSCHEMA DataType to SQL types ---
 function Get-SqlType {
     param($DataType)
     switch ($DataType) {
-        5    { return "DECIMAL(18,2)" }   # DBTYPE_R8 / Double
-        6    { return "DECIMAL(18,4)" }   # DBTYPE_CY / Currency
-        7    { return "DATETIME" }        # DBTYPE_DATE
-        11   { return "BIT" }             # DBTYPE_BOOL
-        20   { return "BIGINT" }          # DBTYPE_I8
-        3    { return "INT" }             # DBTYPE_I4
-        130  { return "NVARCHAR(MAX)" }   # DBTYPE_WSTR
+        2    { return "NVARCHAR(MAX)" }   # String
+        6    { return "BIGINT" }          # Int64 (Whole Number)
+        8    { return "FLOAT" }           # Double (Decimal Number)
+        9    { return "DATETIME" }        # DateTime
+        10   { return "DECIMAL(18,4)" }   # Decimal (Currency)
+        11   { return "BIT" }             # Boolean
         default { return "NVARCHAR(MAX)" }
     }
 }
@@ -108,9 +135,9 @@ function Format-SqlValue {
     }
     $strVal = $Value.ToString()
     switch ($DataType) {
-        { $_ -in 5, 6, 20, 3 } {
-            # Numeric
-            if ($strVal -match '^-?[\d.]+$') { return $strVal }
+        { $_ -in 6, 8, 10 } {
+            # Numeric (Int64, Double, Decimal)
+            if ($strVal -match '^-?[\d.]+([eE][+-]?\d+)?$') { return $strVal }
             else { return "NULL" }
         }
         11 {
@@ -118,8 +145,8 @@ function Format-SqlValue {
             if ($strVal -eq 'True') { return "1" }
             else { return "0" }
         }
-        7 {
-            # Date - format as ISO
+        9 {
+            # DateTime
             try {
                 $dt = [DateTime]::Parse($strVal)
                 return "'" + $dt.ToString("yyyy-MM-dd HH:mm:ss") + "'"
@@ -158,7 +185,7 @@ function Format-CsvValue {
     }
     $strVal = $Value.ToString()
     switch ($DataType) {
-        7 {
+        9 {
             try {
                 $dt = [DateTime]::Parse($strVal)
                 return $dt.ToString("yyyy-MM-dd HH:mm:ss")
@@ -182,6 +209,9 @@ $sb = [System.Text.StringBuilder]::new()
 [void]$sb.AppendLine("-- SQL INSERT statements generated from Power BI model data")
 [void]$sb.AppendLine("-- Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')")
 [void]$sb.AppendLine("-- ============================================================")
+[void]$sb.AppendLine("")
+[void]$sb.AppendLine("SET DATEFORMAT ymd;")
+[void]$sb.AppendLine("GO")
 [void]$sb.AppendLine("")
 
 foreach ($table in $tables) {
